@@ -14,9 +14,12 @@ TEST_PROGRAM = test.py
 TEST_INPUT = input.txt
 TEST_OUTPUT = output.bin
 
+PROGRAM = secure_copy
+PROGRAM_SRC = secure_copy.c
+
 .PHONY: all install test clean
 
-all: $(LIBRARY_NAME)
+all: $(LIBRARY_NAME) $(PROGRAM)
 
 $(LIBRARY_NAME): $(LIBRARY_OBJECT)
 	$(CC) $(LDFLAGS) -o $(LIBRARY_NAME) $(LIBRARY_OBJECT)
@@ -31,5 +34,8 @@ install: $(LIBRARY_NAME)
 test: $(LIBRARY_NAME) $(TEST_INPUT)
 	python3 $(TEST_PROGRAM) ./$(LIBRARY_NAME) 42 $(TEST_INPUT) $(TEST_OUTPUT)
 
+$(PROGRAM): $(PROGRAM_SRC) $(LIBRARY_NAME)
+	$(CC) -pthread -Wall -o $(PROGRAM) $(PROGRAM_SRC) -L. -lcaesar
+
 clean:
-	rm -f $(LIBRARY_OBJECT) $(LIBRARY_NAME)
+	rm -f $(LIBRARY_OBJECT) $(LIBRARY_NAME) $(PROGRAM)

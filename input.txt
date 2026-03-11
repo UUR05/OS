@@ -1,0 +1,5 @@
+Hello, World!
+This is a test file for libcaesar encryption.
+The XOR cipher will encrypt this text.
+Key property: A XOR K XOR K = A
+Binary data test: 0,1,2,3,4,5

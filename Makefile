@@ -35,7 +35,7 @@ test: $(LIBRARY_NAME) $(TEST_INPUT)
 	python3 $(TEST_PROGRAM) ./$(LIBRARY_NAME) 42 $(TEST_INPUT) $(TEST_OUTPUT)
 
 $(PROGRAM): $(PROGRAM_SRC) $(LIBRARY_NAME)
-	$(CC) -pthread -Wall -o $(PROGRAM) $(PROGRAM_SRC) -L. -lcaesar
+	$(CC) -pthread -Wall -o $(PROGRAM) $(PROGRAM_SRC) -L. -lcaesar -lrt
 
 clean:
 	rm -f $(LIBRARY_OBJECT) $(LIBRARY_NAME) $(PROGRAM)

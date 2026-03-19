@@ -2,158 +2,247 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
-#include <signal.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <time.h>
+#include <errno.h>
 #include "caesar.h"
 
 #define BUFFER_SIZE 4096
 #define MAX_FILENAME 256
-
-volatile int keep_running = 1;
+#define TIMEOUT_SEC 5
 
 typedef struct {
-    unsigned char buffer[BUFFER_SIZE];
-    int size;
-    int done;
-    pthread_mutex_t mutex;
-    pthread_cond_t not_empty;
-    pthread_cond_t not_full;
-} Buffer;
-
-/* arguments passed to both producer and consumer threads */
-typedef struct {
-    Buffer *buf;
-    int input_fd;
-    int output_fd;
+    char **files;
+    int num_files;
+    char *output_dir;
     char key;
-} ThreadArgs;
+    int *current_index;
+    int *processed_count;
+    pthread_mutex_t *mutex;
+    FILE *log_file;
+} WorkerArgs;
 
-void sigint_handler(int sig) {
-    keep_running = 0;
-    printf("\nОперация прервана пользователем\n");
+void log_operation(FILE *log_file, pthread_mutex_t *mutex, const char *filename, const char *result, double duration) {
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char time_str[26];
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", tm_info);
+    
+    // Используем отдельный захват мьютекса для логирования
+    struct timespec timeout;
+    clock_gettime(CLOCK_REALTIME, &timeout);
+    timeout.tv_sec += TIMEOUT_SEC;
+    
+    int ret = pthread_mutex_timedlock(mutex, &timeout);
+    if (ret == 0) {
+        fprintf(log_file, "[%s] Thread %lu: %s - %s (%.3f sec)\n", 
+                time_str, (unsigned long)pthread_self(), filename, result, duration);
+        fflush(log_file);
+        pthread_mutex_unlock(mutex);
+    } else if (ret == ETIMEDOUT) {
+        fprintf(stderr, "Log timeout for %s\n", filename);
+    }
 }
 
-void* producer(void* arg) {
-    ThreadArgs *args = (ThreadArgs*)arg;
-    Buffer *shared_buffer = args->buf;
-    int fd = args->input_fd;
-    char key = args->key;
-
-    unsigned char data[BUFFER_SIZE];
-    ssize_t bytes_read;
-
-    while (keep_running) {
-        bytes_read = read(fd, data, BUFFER_SIZE);
-        if (bytes_read <= 0) {
+void* worker(void* arg) {
+    WorkerArgs *args = (WorkerArgs*)arg;
+    
+    while (1) {
+        // Получаем индекс файла для обработки
+        struct timespec timeout;
+        clock_gettime(CLOCK_REALTIME, &timeout);
+        timeout.tv_sec += TIMEOUT_SEC;
+        
+        int ret = pthread_mutex_timedlock(args->mutex, &timeout);
+        if (ret == ETIMEDOUT) {
+            printf("Возможная взаимоблокировка: поток %lu ожидает мьютекс более %d секунд\n", 
+                   (unsigned long)pthread_self(), TIMEOUT_SEC);
+            continue;
+        } else if (ret != 0) {
             break;
         }
-
-        set_key(key);
-        caesar(data, data, bytes_read);
-
-        pthread_mutex_lock(&shared_buffer->mutex);
-        while (shared_buffer->size > 0 && keep_running) {
-            pthread_cond_wait(&shared_buffer->not_full, &shared_buffer->mutex);
-        }
-        if (!keep_running) {
-            pthread_mutex_unlock(&shared_buffer->mutex);
+        
+        // Проверяем, есть ли еще файлы для обработки
+        if (*args->current_index >= args->num_files) {
+            pthread_mutex_unlock(args->mutex);
             break;
         }
-        memcpy(shared_buffer->buffer, data, bytes_read);
-        shared_buffer->size = bytes_read;
-        shared_buffer->done = (bytes_read < BUFFER_SIZE);
-        pthread_cond_signal(&shared_buffer->not_empty);
-        pthread_mutex_unlock(&shared_buffer->mutex);
+        
+        // Получаем имя файла и увеличиваем индекс
+        char *filename = args->files[*args->current_index];
+        (*args->current_index)++;
+        pthread_mutex_unlock(args->mutex);
+
+        // Обрабатываем файл
+        time_t start_time = time(NULL);
+        char result[20] = "success";
+        
+        // Формируем полный путь к выходному файлу
+        char out_path[MAX_FILENAME];
+        // Извлекаем только имя файла из пути (если есть)
+        const char *base_filename = strrchr(filename, '/');
+        if (base_filename == NULL) {
+            base_filename = filename;
+        } else {
+            base_filename++; // Пропускаем '/'
+        }
+        snprintf(out_path, sizeof(out_path), "%s/%s", args->output_dir, base_filename);
+        
+        // Открываем входной файл
+        FILE *in_file = fopen(filename, "rb");
+        if (in_file == NULL) {
+            snprintf(result, sizeof(result), "error: open");
+            log_operation(args->log_file, args->mutex, filename, result, difftime(time(NULL), start_time));
+            continue;
+        }
+        
+        // Определяем размер файла
+        fseek(in_file, 0, SEEK_END);
+        long file_size = ftell(in_file);
+        fseek(in_file, 0, SEEK_SET);
+        
+        if (file_size <= 0) {
+            fclose(in_file);
+            snprintf(result, sizeof(result), "error: empty");
+            log_operation(args->log_file, args->mutex, filename, result, difftime(time(NULL), start_time));
+            continue;
+        }
+        
+        // Читаем файл
+        unsigned char *buffer = (unsigned char*)malloc(file_size);
+        if (buffer == NULL) {
+            fclose(in_file);
+            snprintf(result, sizeof(result), "error: memory");
+            log_operation(args->log_file, args->mutex, filename, result, difftime(time(NULL), start_time));
+            continue;
+        }
+        
+        size_t bytes_read = fread(buffer, 1, file_size, in_file);
+        fclose(in_file);
+        
+        if (bytes_read != file_size) {
+            free(buffer);
+            snprintf(result, sizeof(result), "error: read");
+            log_operation(args->log_file, args->mutex, filename, result, difftime(time(NULL), start_time));
+            continue;
+        }
+        
+        // Шифруем данные
+        set_key(args->key);
+        caesar(buffer, buffer, file_size);
+        
+        // Записываем зашифрованные данные
+        FILE *out_file = fopen(out_path, "wb");
+        if (out_file == NULL) {
+            free(buffer);
+            snprintf(result, sizeof(result), "error: write");
+            log_operation(args->log_file, args->mutex, filename, result, difftime(time(NULL), start_time));
+            continue;
+        }
+        
+        size_t bytes_written = fwrite(buffer, 1, file_size, out_file);
+        fclose(out_file);
+        free(buffer);
+        
+        if (bytes_written != file_size) {
+            snprintf(result, sizeof(result), "error: write");
+        }
+        
+        // Логируем успешную операцию
+        double duration = difftime(time(NULL), start_time);
+        log_operation(args->log_file, args->mutex, filename, result, duration);
+        
+        // Обновляем счетчик обработанных файлов
+        clock_gettime(CLOCK_REALTIME, &timeout);
+        timeout.tv_sec += TIMEOUT_SEC;
+        ret = pthread_mutex_timedlock(args->mutex, &timeout);
+        if (ret == 0) {
+            (*args->processed_count)++;
+            pthread_mutex_unlock(args->mutex);
+        }
     }
-
-    pthread_mutex_lock(&shared_buffer->mutex);
-    shared_buffer->done = 1;
-    pthread_cond_signal(&shared_buffer->not_empty);
-    pthread_mutex_unlock(&shared_buffer->mutex);
-
+    
     return NULL;
 }
 
-void* consumer(void* arg) {
-    ThreadArgs *args = (ThreadArgs*)arg;
-    Buffer *shared_buffer = args->buf;
-    int fd = args->output_fd;
-
-    while (keep_running) {
-        pthread_mutex_lock(&shared_buffer->mutex);
-        while (shared_buffer->size == 0 && !shared_buffer->done && keep_running) {
-            pthread_cond_wait(&shared_buffer->not_empty, &shared_buffer->mutex);
+int main(int argc, char *argv[]) {
+    if (argc < 4) {
+        fprintf(stderr, "Usage: %s file1 file2 ... output_dir key\n", argv[0]);
+        fprintf(stderr, "Example: %s file1.txt file2.txt file3.txt output_dir 3\n", argv[0]);
+        return 1;
+    }
+    
+    // Парсим аргументы
+    int num_files = argc - 3;
+    char *output_dir = argv[argc - 2];
+    char key = (char)atoi(argv[argc - 1]);
+    char **files = &argv[1];
+    
+    printf("Starting secure_copy with %d files, output_dir=%s, key=%d\n", 
+           num_files, output_dir, key);
+    
+    // Создаем выходную директорию
+    struct stat st = {0};
+    if (stat(output_dir, &st) == -1) {
+        if (mkdir(output_dir, 0755) != 0) {
+            perror("mkdir");
+            return 1;
         }
-        if (!keep_running || (shared_buffer->size == 0 && shared_buffer->done)) {
-            pthread_mutex_unlock(&shared_buffer->mutex);
-            break;
+        printf("Created output directory: %s\n", output_dir);
+    }
+    
+    // Открываем лог-файл в режиме добавления
+    FILE *log_file = fopen("log.txt", "a");
+    if (!log_file) {
+        perror("fopen log.txt");
+        return 1;
+    }
+    printf("Log file opened: log.txt\n");
+    
+    // Инициализируем мьютекс
+    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    
+    // Общие переменные
+    int current_index = 0;
+    int processed_count = 0;
+    
+    // Аргументы для рабочих потоков
+    WorkerArgs args = {
+        .files = files,
+        .num_files = num_files,
+        .output_dir = output_dir,
+        .key = key,
+        .current_index = &current_index,
+        .processed_count = &processed_count,
+        .mutex = &mutex,
+        .log_file = log_file
+    };
+    
+    // Создаем 3 рабочих потока
+    pthread_t threads[3];
+    for (int i = 0; i < 3; i++) {
+        if (pthread_create(&threads[i], NULL, worker, &args) != 0) {
+            perror("pthread_create");
+            fclose(log_file);
+            return 1;
         }
-        write(fd, shared_buffer->buffer, shared_buffer->size);
-        shared_buffer->size = 0;
-        pthread_cond_signal(&shared_buffer->not_full);
-        pthread_mutex_unlock(&shared_buffer->mutex);
+        printf("Created thread %d\n", i);
     }
-    return NULL;
-}
-
-int main(int argc, char* argv[]) {
-    if (argc != 4) {
-        fprintf(stderr, "Использование: %s <входной_файл> <выходной_файл> <ключ>\n", argv[0]);
-        return 1;
+    
+    // Ожидаем завершения всех потоков
+    for (int i = 0; i < 3; i++) {
+        pthread_join(threads[i], NULL);
+        printf("Thread %d joined\n", i);
     }
-
-    char* input_file = argv[1];
-    char* output_file = argv[2];
-    int key = atoi(argv[3]);
-
-    if (key < 0 || key > 255) {
-        fprintf(stderr, "Ключ должен быть от 0 до 255\n");
-        return 1;
-    }
-
-    int input_fd = open(input_file, O_RDONLY);
-    if (input_fd == -1) {
-        perror("Ошибка открытия входного файла");
-        return 1;
-    }
-
-    int output_fd = open(output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (output_fd == -1) {
-        perror("Ошибка открытия выходного файла");
-        close(input_fd);
-        return 1;
-    }
-
-    Buffer shared_buffer;
-    shared_buffer.size = 0;
-    shared_buffer.done = 0;
-    pthread_mutex_init(&shared_buffer.mutex, NULL);
-    pthread_cond_init(&shared_buffer.not_empty, NULL);
-    pthread_cond_init(&shared_buffer.not_full, NULL);
-
-    signal(SIGINT, sigint_handler);
-
-    ThreadArgs args;
-    args.buf = &shared_buffer;
-    args.input_fd = input_fd;
-    args.output_fd = output_fd;
-    args.key = (char)key;
-
-    pthread_t prod_thread, cons_thread;
-    pthread_create(&prod_thread, NULL, producer, &args);
-    pthread_create(&cons_thread, NULL, consumer, &args);
-
-    pthread_join(prod_thread, NULL);
-    pthread_join(cons_thread, NULL);
-
-    close(input_fd);
-    close(output_fd);
-
-    pthread_mutex_destroy(&shared_buffer.mutex);
-    pthread_cond_destroy(&shared_buffer.not_empty);
-    pthread_cond_destroy(&shared_buffer.not_full);
-
+    
+    // Закрываем лог-файл
+    fclose(log_file);
+    
+    printf("All files processed. Total: %d files\n", processed_count);
+    printf("Check log.txt for details\n");
+    
     return 0;
 }

@@ -20,7 +20,6 @@ void set_key(char key);
  * @param len Количество байт для обработки
  */
 void caesar(void* src, void* dst, int len);
-void caesar(void* src, void* dst, int len);
 
 #ifdef __cplusplus
 }

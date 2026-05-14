@@ -463,7 +463,6 @@ int main(int argc, char *argv[]) {
     int num_files;
     char **files;
     const char *output_dir;
-    int key;
     RunStats primary_stats;
 
     if (argc < 4) {
@@ -488,7 +487,6 @@ int main(int argc, char *argv[]) {
     num_files = argc - arg_offset - 2;
     files = &argv[arg_offset];
     output_dir = argv[argc - 2];
-    key = atoi(argv[argc - 1]);
 
     if (num_files <= 0) {
         fprintf(stderr, "At least one input file is required.\n");
@@ -499,7 +497,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    set_key((char)key);
+    set_key((char)atoi(argv[argc - 1]));
 
     if (requested_mode == MODE_AUTO) {
         selected_mode = (num_files < 5) ? MODE_SEQUENTIAL : MODE_PARALLEL;
@@ -533,5 +531,6 @@ int main(int argc, char *argv[]) {
         print_comparison(selected_mode, primary_stats, alt_mode, alt_stats);
     }
 
+    destroy_key();
     return (primary_stats.failed == 0) ? 0 : 2;
 }

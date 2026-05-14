@@ -14,6 +14,11 @@ extern "C" {
 void set_key(char key);
 
 /**
+ * Clears and releases the protected key storage.
+ */
+void destroy_key(void);
+
+/**
  * Выполняет XOR-шифрование/дешифрование.
  * @param src Указатель на исходный буфер
  * @param dst Указатель на буфер назначения
